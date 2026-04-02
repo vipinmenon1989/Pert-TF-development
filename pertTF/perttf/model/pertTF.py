@@ -1,0 +1,756 @@
+from torch import nn, Tensor
+from typing import Dict, Mapping, Optional, Tuple, Any, Union
+#from scgpt.model import BatchLabelEncoder
+from tqdm import trange
+
+import numpy as np
+
+import torch
+from torch import nn
+from torch.distributions import Bernoulli
+import torch.nn.functional as F
+
+import torch.distributed as dist
+
+
+
+import scgpt as scg
+from scgpt.model import TransformerModel
+from torch.nn import TransformerEncoder
+from perttf.model.modules import ExpressionActivate
+
+class LogitNorm(nn.Module):
+
+    def __init__(self, module ,t=1.0):
+        super(LogitNorm, self).__init__()
+        self.module = module
+        self.t = t
+
+    def forward(self, x):
+        x = self.module(x)
+        norms = torch.norm(x, p=2, dim=-1, keepdim=True) + 1e-7
+        logit_norm = torch.div(x, norms) / self.t
+        return logit_norm
+
+class PerturbationDecoder(nn.Module):
+    """
+    Decoder for perturbation label prediction.
+    revised from scGPT.ClsDecoder
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_pert: int,
+        nlayers: int = 3,
+        activation: callable = nn.ReLU,
+    ):
+        super().__init__()
+        # module list
+        self._decoder = nn.ModuleList()
+        for i in range(nlayers - 1):
+            self._decoder.append(nn.Linear(d_model, d_model))
+            self._decoder.append(activation())
+            self._decoder.append(nn.LayerNorm(d_model))
+        self.out_layer = nn.Linear(d_model, n_pert)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Tensor, shape [batch_size, embsize]
+        """
+        for layer in self._decoder:
+            x = layer(x)
+        return self.out_layer(x)
+
+
+class PSDecoder(nn.Module):
+    """
+    Decoder for ps score prediction.
+    revised from scGPT.ClsDecoder
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_pert: int,
+        nlayers: int = 3,
+        activation: callable = nn.ReLU,
+        geneinput: bool = False,
+    ):
+        super().__init__()
+        # module list
+        self._decoder = nn.ModuleList()
+        if geneinput:
+            self.input_dim =  d_model * 2 #this is a concatenation of cell embedding and perturbation embedding
+        else:
+            self.input_dim = d_model # just cell embedding
+        
+        for i in range(nlayers - 1):
+            if i == 0:
+                self._decoder.append(nn.Linear(self.input_dim, d_model))
+            else:
+                self._decoder.append(nn.Linear(d_model, d_model))
+            self._decoder.append(activation())
+            self._decoder.append(nn.LayerNorm(d_model))
+        self.out_layer = nn.Linear(d_model, n_pert)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Tensor, shape [batch_size, embsize]
+        """
+        for layer in self._decoder:
+            x = layer(x)
+        return self.out_layer(x)
+
+class Batch2LabelEncoder(nn.Module):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(
+            num_embeddings, embedding_dim, padding_idx=padding_idx
+        )
+        self.enc_norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.embedding(x)  # (batch, embsize)
+        x = self.enc_norm(x)
+        return x
+
+class PertLabelEncoder(nn.Module):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(
+            num_embeddings, embedding_dim, padding_idx=padding_idx
+        )
+        self.enc_norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.embedding(x)  # (batch, embsize)
+        x = self.enc_norm(x)
+        return x
+
+
+class PertExpEncoder(nn.Module):
+    """
+    Concatenating gene expression embeddings (from transformers) with perturbation embeddings (from scGPT's PertEncoder)
+    """
+    def __init__(
+        self,
+        d_model: int,
+        d_pert_emb: int = None,
+        mode: str = 'concat'
+    ):
+        super().__init__()
+        d_pert_emb = d_model if d_pert_emb is None else d_pert_emb
+        self.pert_exp_mode = mode
+        if d_pert_emb != d_model and mode == 'direct_sum':
+            self.pert_exp_mode = 'concat'
+        if self.pert_exp_mode == 'direct_sum':
+            d_pert_emb = 0
+        d_in = d_model + d_pert_emb
+        #d_in = d_model
+        self.fc = nn.Sequential(
+            nn.Linear(d_in, d_model),
+            nn.PReLU(),#nn.Sigmoid(),#nn.ReLU(),#nn.LeakyReLU(),
+            nn.Linear(d_model, d_model),
+            nn.PReLU(),#nn.Sigmoid(),#nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.PReLU(),
+            nn.LayerNorm(d_model),
+            #nn.Linear(d_model, d_model),
+        )
+
+
+    def forward(self, x: Tensor, pert: Tensor) -> Dict[str, Tensor]:
+        """x is the output of the transformer concatenated with perturbation embedding, (batch, d_model*2)"""
+        # pred_value = self.fc(x).squeeze(-1)  
+        tf_concat=torch.cat([x, pert], dim=1)
+        if self.pert_exp_mode == 'sum': # sum of residual with orig emb
+                #tf_concat = cell_emb_orig + pert_emb_next
+                cell_emb_next=self.fc(tf_concat)+x
+        elif self.pert_exp_mode == 'direct_sum': # don't transform, just add
+                cell_emb_next=x + pert
+        elif self.pert_exp_mode == 'concat':
+                cell_emb_next=self.fc(tf_concat) # transform the concat
+        return cell_emb_next # (batch, d_model)
+
+
+
+class PerturbationTFModel(TransformerModel):
+    def __init__(self,
+                 n_pert: int,
+                 nlayers_pert: int,
+                 n_ps: int,
+                 *args, **kwargs):
+        # pop out params uniquely for pertTF
+        self.pred_lochness_next = kwargs.pop("pred_lochness_next", False) # additional optional parameter to ask whether to predict lochness scores
+        ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
+        self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
+        self.pert_embed_dim = kwargs.pop("pert_embed_dim", None) # set the pert_embedding dim
+        self.sep_genotype_embed = kwargs.pop("sep_genotype_embed", False)
+        self.pert_exp_mode = kwargs.pop("pert_exp_mode", 'concat')
+        self.pert_exp_mode = self.pert_exp_mode if self.pert_exp_mode in ['concat', 'sum', 'direct_sum'] else 'concat'
+        self.expr_activation = kwargs.pop('expr_activation', 'elu')
+        self.logit_norm = kwargs.pop('logit_norm', False)
+        super().__init__(*args, **kwargs)
+        self.expr_act = ExpressionActivate(activation = self.expr_activation)
+        # add perturbation encoder
+        # variables are defined in super class
+        d_model = self.d_model
+        self.pert_embed_dim = d_model if self.pert_embed_dim is None else self.pert_embed_dim
+        #self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
+        self.pert_encoder = PertLabelEncoder(n_pert, self.pert_embed_dim, padding_idx=self.pert_pad_id)
+        self.genotype_encoder = self.pert_encoder # these two are default to be the same thing
+        if self.pert_embed_dim != self.d_model or self.sep_genotype_embed:
+            self.genotype_encoder = PertLabelEncoder(n_pert, self.d_model, padding_idx=self.pert_pad_id)
+        self.pert_exp_encoder = PertExpEncoder(d_model, d_pert_emb = self.pert_embed_dim, mode = self.pert_exp_mode) 
+        
+        
+        # the following is the perturbation decoder
+        #n_pert = kwargs.get("n_perturb", 1) 
+        #nlayers_pert = kwargs.get("nlayers_perturb", 3) 
+        self.pert_decoder = PerturbationDecoder(d_model, n_pert, nlayers=nlayers_pert)
+        if self.logit_norm: # this creates very different loss values
+            self.pert_decoder = LogitNorm(module = self.pert_decoder, t=0.1)
+            self.cls_decoder = LogitNorm(module = self.cls_decoder, t=0.1)
+        # added: batch2 encoder, especially to model different cellular systems like cell line vs primary cells
+        self.batch2_pad_id = None #kwargs.get("batch2_pad_id") if "batch2_pad_id" in kwargs else 2
+        #self.batch2_encoder = nn.Embedding(2, d_model, padding_idx=self.batch2_pad_id)
+        self.batch2_encoder = Batch2LabelEncoder(2, d_model) # should replace 2 to n_batch later
+        self.n_pert = n_pert
+        self.n_cls = kwargs.get("n_cls", 1) 
+        
+        
+        if kwargs.get('use_fast_transformer', False):
+            nlayers = self.transformer_encoder.num_layers if self.transformer_encoder is not None else 2
+            d_hid = self.transformer_encoder.layers[0].linear1.out_features if self.transformer_encoder is not None else 32
+            nhead = self.transformer_encoder.layers[0].self_attn.num_heads if self.transformer_encoder is not None else 4
+            try:
+                from perttf.model.modules import FlashTransformerEncoderLayerVarlen, SDPATransformerEncoderLayer
+                
+                encoder_layers = FlashTransformerEncoderLayerVarlen(
+                    d_model,
+                    kwargs.get('nhead', nhead),
+                    kwargs.get('d_hid', d_hid),
+                    kwargs.get('dropout', 0.1),
+                    batch_first=True,
+                    norm_scheme=self.norm_scheme,
+                )
+                if encoder_layers.flash_version is not None:
+                    self.transformer_encoder = TransformerEncoder(encoder_layers, kwargs.get('nlayers', nlayers))
+            except Exception as e: 
+                print(e)
+                print('Custom flash attention v2/v3 setup failed, falling back to scGPT implementation')
+        
+        # added: adding PS score decoder
+        #self.n_ps = kwargs.get("n_ps") if "n_ps" in kwargs else 0
+        self.n_ps = n_ps
+        if self.n_ps > 0:
+            self.ps_decoder = PSDecoder(d_model, self.n_ps, nlayers = nlayers_pert)
+        else:
+            self.ps_decoder = None
+        if self.pred_lochness_next:
+            self.ps_decoder2 = PSDecoder(d_model, 1, nlayers = ps_decoder2_nlayer, geneinput = True)
+        else:
+            self.ps_decoder2 = None
+        self.ps_head_enabled = (self.ps_decoder is not None)
+    # rewrite encode function
+    def _encode(
+        self,
+        src: Tensor,
+        values: Tensor,
+        src_key_padding_mask: Tensor,
+        batch_labels: Optional[Tensor] = None,  # (batch,)
+        input_pert_flags: Optional[Tensor] = None,
+    ) -> Tensor:
+        #print('_encode batch labels:')
+        #print(batch_labels)
+        self._check_batch_labels(batch_labels)
+
+        src = self.encoder(src)  # (batch, seq_len, embsize)
+        self.cur_gene_token_embs = src
+
+        values = self.value_encoder(values)  # (batch, seq_len, embsize)
+
+        if self.input_emb_style == "scaling":
+            values = values.unsqueeze(2)
+            total_embs = src * values
+        else:
+            total_embs = src + values
+
+        # add additional perturbs
+        if input_pert_flags is not None:
+            perts = self.genotype_encoder(input_pert_flags)  # (batch, seq_len, embsize)
+            #import pdb; pdb.set_trace()
+            perts_expand = perts.unsqueeze(1).repeat(1, total_embs.shape[1], 1)
+            total_embs = total_embs + perts_expand
+
+        # batch2 TODO: use batch_encoder instead
+        if batch_labels is not None:
+            batch2_embs = self.batch2_encoder(batch_labels)
+            #import pdb; pdb.set_trace()
+            batch2_embs = batch2_embs.unsqueeze(1).repeat(1, total_embs.shape[1], 1)
+            total_embs = total_embs + batch2_embs
+
+        # dsbn and batch normalization
+        if getattr(self, "dsbn", None) is not None:
+            batch_label = int(batch_labels[0].item())
+            total_embs = self.dsbn(total_embs.permute(0, 2, 1), batch_label).permute(
+                0, 2, 1
+            )  # the batch norm always works on dim 1
+        elif getattr(self, "bn", None) is not None:
+            total_embs = self.bn(total_embs.permute(0, 2, 1)).permute(0, 2, 1)
+
+
+        output = self.transformer_encoder(
+            total_embs, src_key_padding_mask=src_key_padding_mask
+        )
+        return output  # (batch, seq_len, embsize)
+
+    def forward(
+        self,
+        src: Tensor,
+        values: Tensor,
+        src_key_padding_mask: Tensor,
+        batch_labels: Optional[Tensor] = None,
+        pert_labels: Optional[Tensor] = None, 
+        pert_labels_next: Optional[Tensor] = None, 
+        perturbation: Optional[Tensor] = None, 
+        inv_perturbation: Optional[Tensor] = None, 
+        pert_scale: Optional[Tensor] = None,
+        inv_pert_scale: Optional[Tensor] = None,
+        values_next: Tensor = None,
+        CLS: bool = False,
+        CCE: bool = False,
+        MVC: bool = False,
+        ECS: bool = False,
+        PERTPRED: bool = False,
+        do_sample: bool = False,
+        PSPRED: bool = False,
+        mvc_src: Tensor = None 
+    ) -> Mapping[str, Tensor]:
+        """
+        Args:
+            src (:obj:`Tensor`): token ids, shape [batch_size, seq_len]
+            values (:obj:`Tensor`): token values, shape [batch_size, seq_len]
+            src_key_padding_mask (:obj:`Tensor`): mask for src, shape [batch_size,
+                seq_len]
+            batch_labels (:obj:`Tensor`): batch labels, shape [batch_size]
+            pert_labels (:obj:`Tensor`): perturbation labels, shape [batch_size]
+            pert_labels_next (:obj:`Tensor`): perturbation labels for prediction, shape [batch_size]
+            CLS (:obj:`bool`): if True, return the celltype classification objective
+                (CLS) output
+            CCE (:obj:`bool`): if True, return the contrastive cell embedding objective
+                (CCE) output
+            MVC (:obj:`bool`): if True, return the masked value prediction for cell
+                embedding MVC output
+            ECS (:obj:`bool`): if True, return the elastic cell similarity objective
+                (ECS) output.
+            PERTPRED (:obj:`bool`): if True, return the perturbation prediction
+                (PERTPRED) output. 
+            PSPRED (:obj:`bool`): if True, return the PS score prediction 
+                (PERTPRED) output. 
+
+        Returns:
+            dict of output Tensors.
+        """
+        #print('forward batch labels:')
+        #print(batch_labels)
+        # call the super forward function
+        #output = super().forward(
+        #    src,
+        #    values,
+        #    src_key_padding_mask,
+        #    batch_labels=batch_labels,
+        #    CLS=CLS,
+        #    CCE=CCE,
+        #    MVC=MVC,
+        #    ECS=ECS,
+        #    do_sample=do_sample,
+        #)
+
+        # or, rewrite the forward function
+        
+        transformer_output_0 = self._encode(
+            src, values, src_key_padding_mask, batch_labels,
+            input_pert_flags= pert_labels, # Do we use pert_flags for transformer input?
+        )
+        if self.use_batch_labels:
+            batch_emb = self.batch_encoder(batch_labels)  # (batch, embsize)
+
+        if pert_labels is not None :
+            pert_emb = self.pert_encoder(pert_labels)
+            # transformmer output concatenate ?
+            # note only input pert_labels should be concatenated, not pert_label_next
+            #import pdb; pdb.set_trace()
+            #tf_o_concat=torch.cat(
+            #    [
+            #        transformer_output_0,
+            #        pert_emb.unsqueeze(1).repeat(1, transformer_output_0.shape[1], 1),
+            #   ],
+            #    dim=2,
+            #)
+            #transformer_output=self.pert_exp_encoder(tf_o_concat)
+        else:
+            #tf_o_concat = None # a placeholder
+            pert_emb = None
+        
+        transformer_output=transformer_output_0
+            
+        output = {}
+        output["contrastive_dict"] = {}
+        mlm_output = self.decoder(
+            transformer_output
+            if not self.use_batch_labels
+            else torch.cat(
+                [
+                    transformer_output,
+                    batch_emb.unsqueeze(1).repeat(1, transformer_output.shape[1], 1),
+                ],
+                dim=2,
+            ),
+            # else transformer_output + batch_emb.unsqueeze(1),
+        )
+        # zero_probs is actually non-zero probability for the Bernoulli
+        if self.explicit_zero_prob and do_sample:
+            bernoulli = Bernoulli(probs=mlm_output["zero_probs"])
+            output["mlm_output"] = bernoulli.sample() * self.expr_act(mlm_output["pred"])
+        else:
+            output["mlm_output"] = self.expr_act(mlm_output["pred"])  # (batch, seq_len)
+        if self.explicit_zero_prob:
+            output["mlm_zero_probs"] = mlm_output["zero_probs"]
+
+        cell_emb_orig = self._get_cell_emb_from_layer(transformer_output, values)        
+        output["contrastive_dict"]['orig_emb0'] = cell_emb_orig
+        #  concatenate cell embedding with perturbation embedding to generate next cell embedding
+        if perturbation is not None: #and False:
+            #import pdb; pdb.set_trace()
+            pert_emb_next = self.pert_encoder(perturbation)
+            pert_emb_next = pert_emb_next*pert_scale if pert_scale is not None else pert_emb_next
+            cell_emb_next=self.pert_exp_encoder(cell_emb_orig, pert_emb_next) # transform the concat
+            output["contrastive_dict"]['next_emb0'] = cell_emb_next
+        else:
+            tf_concat = None # add a placeholder
+            cell_emb_next=cell_emb_orig
+        
+        cell_emb = cell_emb_orig
+        output["cell_emb"] = cell_emb
+        output["cell_emb_next"] = cell_emb_next
+
+        if CLS:
+            output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
+            output["cls_output_next"] = self.cls_decoder(cell_emb_next)  # (batch, n_cls)
+        if CCE and values_next is not None:
+            cell1 = cell_emb
+            cell1_next = cell_emb_next
+            transformer_output2 = self._encode(
+                src, values_next, src_key_padding_mask, batch_labels,
+                input_pert_flags= pert_labels_next # Do we use pert_flags for transformer input?
+            )
+            cell2 = self._get_cell_emb_from_layer(transformer_output2)
+            output["contrastive_dict"]['next_emb1'] = cell2
+            cell2_next = None
+            if inv_perturbation is not None:
+                inv_pert_emb_next = self.pert_encoder(inv_perturbation)
+                inv_pert_emb_next = inv_pert_emb_next * inv_pert_scale if inv_pert_scale is not None else inv_pert_emb_next
+                cell2_next = self.pert_exp_encoder(cell2, inv_pert_emb_next)
+            output["contrastive_dict"]['orig_emb1'] = cell2_next
+            
+        cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
+        if MVC:
+            mvc_output = self.mvc_decoder(
+                cell_emb
+                if not self.use_batch_labels
+                else torch.cat([cell_emb, batch_emb], dim=1),
+                # else cell_emb + batch_emb,
+                cur_gene_token_embs,
+            )
+            mvc_output_next = self.mvc_decoder(
+                cell_emb_next
+                if not self.use_batch_labels
+                else torch.cat([cell_emb_next, batch_emb], dim=1),
+                # else cell_emb + batch_emb,
+                cur_gene_token_embs, # is it working well??
+            )
+            if self.explicit_zero_prob and do_sample:
+                bernoulli = Bernoulli(probs=mvc_output["zero_probs"])
+                output["mvc_output"] = bernoulli.sample() * self.expr_act(mvc_output["pred"])
+
+                bernoulli_n = Bernoulli(probs=mvc_output_next["zero_probs"])
+                output["mvc_output_next"] = bernoulli_n.sample() * self.expr_act(mvc_output_next["pred"])
+            else:
+                output["mvc_output"] = self.expr_act(mvc_output["pred"])  # (batch, seq_len)
+                output["mvc_output_next"] = self.expr_act(mvc_output_next["pred"]) # (batch, seq_len)
+            if self.explicit_zero_prob:
+                output["mvc_zero_probs"] = mvc_output["zero_probs"]
+                output["mvc_zero_probs_next"] = mvc_output_next["zero_probs"]
+        if ECS:
+            # Here using customized cosine similarity instead of F.cosine_similarity
+            # to avoid the pytorch issue of similarity larger than 1.0, pytorch # 78064
+            # normalize the embedding
+            cell_emb_normed = F.normalize(cell_emb, p=2, dim=1)
+            cos_sim = torch.mm(cell_emb_normed, cell_emb_normed.t())  # (batch, batch)
+
+            # mask out diagnal elements
+            mask = torch.eye(cos_sim.size(0)).bool().to(cos_sim.device)
+            cos_sim = cos_sim.masked_fill(mask, 0.0)
+            # only optimize positive similarities
+            cos_sim = F.relu(cos_sim)
+
+            output["loss_ecs"] = torch.mean(1 - (cos_sim - self.ecs_threshold) ** 2)
+
+        if self.do_dab:
+            output["dab_output"] = self.grad_reverse_discriminator(cell_emb)
+
+
+        # get cell embedding
+        if PERTPRED:
+            #cell_emb = output["cell_emb"]
+            output["pert_output"] = self.pert_decoder(cell_emb)  # (batch, n_cls)
+            output["pert_output_next"] = self.pert_decoder(cell_emb_next)  # (batch, n_cls)
+
+        # PS score prediction
+        if PSPRED and self.ps_decoder is not None:
+            output["ps_output"] = self.ps_decoder(cell_emb)
+            if self.pred_lochness_next:
+                tf_concat=torch.cat([cell_emb_orig, pert_emb_next],dim=1)
+                output["ps_output_next"] = self.ps_decoder2(tf_concat)  # this is the concatenation of cell embedding and predictive label (next)
+            else:
+                output["ps_output_next"] = self.ps_decoder(cell_emb_next)  # (batch, n_cls)
+        return output
+
+    def encode_batch_with_perturb(
+        self,
+        src: Tensor,
+        values: Tensor,
+        src_key_padding_mask: Tensor,
+        batch_size: int,
+        batch_labels: Optional[Tensor] = None,
+        pert_labels: Optional[Tensor] = None,
+        pert_labels_next: Optional[Tensor] = None,
+        perturbation: Optional[Tensor] = None,
+        pert_scale: Optional[Tensor] = None,
+        output_to_cpu: bool = True,
+        time_step: Optional[int] = None,
+        return_np: bool = False,
+        predict_expr: bool = False,
+        mvc_src: Tensor = None,
+    ):
+        """
+        Returns (cell_emb, cell_emb_next, pert_logits, cls_logits, ps_logits, ps_logits_next, expr_dict)
+
+        Shapes we guarantee at the end:
+            cell_emb         : [N, d_model]                (or [N, seq_len, d_model] if time_step is None? see below)
+            cell_emb_next    : [N, d_model]                (same convention)
+            pert_logits      : [N, n_pert]
+            cls_logits       : [N, n_cls]
+            ps_logits        : [N, n_ps]        or zeros if ps disabled
+            ps_logits_next   : [N, n_ps or 1]   same rules
+        """
+        N = src.size(0)
+        device = next(self.parameters()).device
+
+        # choose array maker (torch or numpy)
+        array_func = np.zeros if return_np else torch.zeros
+        float32_   = np.float32 if return_np else torch.float32
+
+        # Embedding outputs (can be per-seq or single step)
+        emb_shape = ((N, self.d_model))
+        cell_emb_all      = array_func(emb_shape, dtype=float32_)
+        cell_emb_next_all = array_func(emb_shape, dtype=float32_)
+
+        # Classifier heads are ALWAYS per-cell, not per-token
+        pert_logits_all = array_func((N, self.n_pert), dtype=float32_)
+        cls_logits_all  = array_func((N, self.n_cls),  dtype=float32_)
+
+        # ps heads (may be disabled)
+        n_ps_out = self.n_ps if (self.ps_decoder is not None) else 0
+        if n_ps_out > 0:
+            ps_logits_all = array_func((N, n_ps_out), dtype=float32_)
+        else:
+            ps_logits_all = array_func((N, 0), dtype=float32_)  # empty
+
+        if self.pred_lochness_next:
+            ps_next_dim = 1
+        else:
+            ps_next_dim = n_ps_out
+        if ps_next_dim > 0:
+            ps_logits_next_all = array_func((N, ps_next_dim), dtype=float32_)
+        else:
+            ps_logits_next_all = array_func((N, 0), dtype=float32_)
+
+        # expression preds bucket
+        expr_dict = {}
+        if predict_expr:
+            mlm_expr_shape      = (N, src.size(1))
+            mvc_expr_shape      = (N, mvc_src.size(1)) if mvc_src is not None else (N, src.size(1))
+            mlm_outputs         = array_func(mlm_expr_shape, dtype=float32_)
+            mlm_zero_outputs    = array_func(mlm_expr_shape, dtype=float32_)
+            mvc_outputs         = array_func(mvc_expr_shape, dtype=float32_)
+            mvc_zero_outputs    = array_func(mvc_expr_shape, dtype=float32_)
+            mvc_next_outputs    = array_func(mvc_expr_shape, dtype=float32_)
+            mvc_next_zero_out   = array_func(mvc_expr_shape, dtype=float32_)
+
+        # loop over minibatches
+        for i in trange(0, N, batch_size):
+            sl = slice(i, i + batch_size)
+
+            src_d  = src[sl].to(device)
+            val_d  = values[sl].to(device)
+            pad_d  = src_key_padding_mask[sl].to(device)
+
+            bl_d   = batch_labels[sl].to(device)       if batch_labels is not None else None
+            pl_d   = pert_labels[sl].to(device)         if pert_labels is not None else None
+            pln_d  = pert_labels_next[sl].to(device)    if pert_labels_next is not None else None
+            pert_d = perturbation[sl].to(device)        if perturbation is not None else None
+            pscale_d = pert_scale[sl].to(device)        if pert_scale is not None else None
+            mvc_src_d = mvc_src[sl].to(device)          if mvc_src is not None else None
+
+            # run encoder (per-token transformer output)
+            raw_output = self._encode(
+                src_d,
+                val_d,
+                pad_d,
+                bl_d,
+                input_pert_flags=pl_d,
+            )
+
+            # get per-cell embedding
+            cell_emb = self._get_cell_emb_from_layer(raw_output, val_d)
+
+            # build "next" embedding if we have a perturbation
+            if pert_d is not None:
+                pert_emb_next = self.pert_encoder(pert_d)
+                if pscale_d is not None:
+                    pert_emb_next = pert_emb_next * pscale_d
+                cell_emb_next = self.pert_exp_encoder(cell_emb, pert_emb_next)
+            else:
+                cell_emb_next = cell_emb
+
+            # select timestep slice if requested
+            # move to CPU / numpy if needed
+            # move to CPU / numpy if needed
+            def _postproc(t):
+                if not return_np:
+                    if output_to_cpu:
+                        return t.detach().cpu()
+                    return t.detach()
+                if output_to_cpu:
+                    return t.detach().cpu().numpy()
+                return t.detach().numpy()
+
+            # stash per-cell embeddings directly (shape [B, d_model])
+            emb_cell      = cell_emb          # [B, d_model]
+            emb_cell_next = cell_emb_next     # [B, d_model]
+
+            cell_emb_all[sl]      = _postproc(emb_cell)
+            cell_emb_next_all[sl] = _postproc(emb_cell_next)
+            # classifier heads (per-cell)
+            pert_logits = self.pert_decoder(cell_emb)     # [B, n_pert]
+            cls_logits  = self.cls_decoder(cell_emb)      # [B, n_cls]
+
+            pert_logits_all[sl] = _postproc(pert_logits)
+            cls_logits_all[sl]  = _postproc(cls_logits)
+
+            # ps heads
+            if self.ps_decoder is not None:
+                ps_logits_cur = self.ps_decoder(cell_emb)  # [B, n_ps]
+                ps_logits_all[sl] = _postproc(ps_logits_cur)
+
+                if self.pred_lochness_next and (self.ps_decoder2 is not None) and (pert_d is not None):
+                    # concat original + pert emb
+                    pert_emb_next = self.pert_encoder(pert_d)
+                    if pscale_d is not None:
+                        pert_emb_next = pert_emb_next * pscale_d
+                    tf_concat = torch.cat([cell_emb, pert_emb_next], dim=1)
+                    ps_logits_next = self.ps_decoder2(tf_concat)  # [B, 1]
+                else:
+                    # default "next" == current
+                    ps_logits_next = ps_logits_cur
+
+                ps_logits_next_all[sl] = _postproc(ps_logits_next)
+            else:
+                # ps head disabled
+                # fill zeros only if arrays have width >0
+                if ps_logits_all.shape[1] > 0:
+                    ps_logits_all[sl] = 0.0
+                if ps_logits_next_all.shape[1] > 0:
+                    ps_logits_next_all[sl] = 0.0
+
+            # optional expression preds (unchanged logic, just moved)
+            if predict_expr:
+                if self.use_batch_labels:
+                    batch_emb = self.batch_encoder(bl_d)
+
+                mlm_out = self.decoder(
+                    raw_output
+                    if not self.use_batch_labels
+                    else torch.cat(
+                        [raw_output, batch_emb.unsqueeze(1).repeat(1, raw_output.shape[1], 1)],
+                        dim=2,
+                    ),
+                )
+
+                cur_gene_token_embs = self.encoder(mvc_src_d) if mvc_src_d is not None else self.cur_gene_token_embs
+
+                mvc_out = self.mvc_decoder(
+                    cell_emb if not self.use_batch_labels
+                    else torch.cat([cell_emb, batch_emb], dim=1),
+                    cur_gene_token_embs,
+                )
+
+                if pln_d is not None:
+                    mvc_out_next = self.mvc_decoder(
+                        cell_emb_next if not self.use_batch_labels
+                        else torch.cat([cell_emb_next, batch_emb], dim=1),
+                        cur_gene_token_embs,
+                    )
+                else:
+                    mvc_out_next = mvc_out
+
+                mlm_pred = self.expr_act(mlm_out["pred"])
+                mlm_zero = mlm_out["zero_probs"] if self.explicit_zero_prob else torch.ones_like(mlm_pred)
+
+                mvc_pred      = self.expr_act(mvc_out["pred"])
+                mvc_zero      = mvc_out["zero_probs"]      if self.explicit_zero_prob else torch.ones_like(mvc_pred)
+                mvc_pred_next = self.expr_act(mvc_out_next["pred"])
+                mvc_zero_next = mvc_out_next["zero_probs"] if self.explicit_zero_prob else torch.ones_like(mvc_pred_next)
+
+                mlm_pred_p, mlm_zero_p = _postproc(mlm_pred), _postproc(mlm_zero)
+                mvc_pred_p, mvc_zero_p = _postproc(mvc_pred), _postproc(mvc_zero)
+                mvc_pred_next_p, mvc_zero_next_p = _postproc(mvc_pred_next), _postproc(mvc_zero_next)
+
+                mlm_outputs[sl]        = mlm_pred_p
+                mlm_zero_outputs[sl]   = mlm_zero_p
+                mvc_outputs[sl]        = mvc_pred_p
+                mvc_zero_outputs[sl]   = mvc_zero_p
+                mvc_next_outputs[sl]   = mvc_pred_next_p
+                mvc_next_zero_out[sl]  = mvc_zero_next_p
+
+        # finalize expr_dict
+        if predict_expr:
+            expr_dict["mlm_expr"]       = (mlm_outputs[:, 1:],      mlm_zero_outputs[:, 1:])
+            expr_dict["mvc_expr"]       = (mvc_outputs[:, 1:],      mvc_zero_outputs[:, 1:])
+            expr_dict["mvc_next_expr"]  = (mvc_next_outputs[:, 1:], mvc_next_zero_out[:, 1:])
+
+        # return in the exact order eval_testdata expects
+        return (
+            cell_emb_all,
+            cell_emb_next_all,
+            pert_logits_all,
+            cls_logits_all,
+            ps_logits_all,
+            ps_logits_next_all,
+            expr_dict,
+        )
